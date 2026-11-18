@@ -6,12 +6,28 @@ const createJestConfig = nextJest({
 
 /** @type {import('jest').Config} */
 const customJestConfig = {
+  // `jest.setup.js` registers jest-axe's `toHaveNoViolations` matcher (and the
+  // jest-dom matchers) for every suite, including the a11y journey tests.
   setupFilesAfterEnv: ["<rootDir>/jest.setup.js"],
   testEnvironment: "jest-environment-jsdom",
   moduleNameMapper: {
     "^@/(.*)$": "<rootDir>/$1",
   },
-  testMatch: ["**/__tests__/**/*.[jt]s?(x)", "**/?(*.)+(spec|test).[jt]s?(x)"],
+  // ── Accessibility journeys (Issue #351) ───────────────────────────────────
+  //
+  // Route-level axe + keyboard-only journeys live in
+  // `__tests__/a11y-journeys/`. They are matched by the generic patterns below,
+  // but the explicit entry keeps them discoverable and guarantees they run even
+  // if the generic patterns are ever narrowed.
+  testMatch: [
+    "<rootDir>/__tests__/a11y-journeys/**/*.[jt]s?(x)",
+    "**/__tests__/**/*.[jt]s?(x)",
+    "**/?(*.)+(spec|test).[jt]s?(x)",
+  ],
+
+  // Journey tests drive full route transitions and dialogs; give them room so
+  // CI does not flake on slower runners.
+  testTimeout: 20000,
 
   // ── Coverage (Issue #1812) ────────────────────────────────────────────────
   //

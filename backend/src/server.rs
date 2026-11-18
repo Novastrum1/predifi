@@ -520,6 +520,19 @@ where
     // Record process start so readiness probes honour the startup grace period.
     PROCESS_START.get_or_init(Instant::now);
 
+    // Fail fast on unsafe database connection budgets before any pool is
+    // created or the listener is bound. Independent service pools multiplied
+    // by the maximum replica count must stay within the PostgreSQL connection
+    // limit, leaving headroom for administration.
+    if let Err(error) = crate::connection_budget::validate(&config) {
+        error!(
+            error = %error,
+            "unsafe database connection budget; refusing to start. Reduce pool sizes or \
+             replica counts, or raise the database connection limit."
+        );
+        std::process::exit(1);
+    }
+
     let pool = crate::db::create_pool(&config)
         .await
         .unwrap_or_else(|error| {

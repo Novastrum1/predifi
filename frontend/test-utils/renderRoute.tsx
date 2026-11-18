@@ -21,6 +21,12 @@ export interface RouteRenderOptions {
   address?: string | null;
   /** Seed entries into the SWR cache before render (keyed by request URL). */
   swrFallback?: Record<string, unknown>;
+  /**
+   * Overrides merged into the deterministic wallet state. Use this to model
+   * connecting/error states in accessibility journeys without touching the
+   * network or timers.
+   */
+  wallet?: Partial<WalletConnectionState>;
 }
 
 /** A minimal but complete WalletConnectionState for tests. */
@@ -36,6 +42,18 @@ export function walletState(address: string | null): WalletConnectionState {
   };
 }
 
+/**
+ * Build a deterministic wallet state for a journey: the base state above with
+ * any overrides applied. `connect`/`disconnect`/`clearError` stay stable no-op
+ * spies unless explicitly overridden.
+ */
+export function mockWalletState(
+  address: string | null,
+  overrides: Partial<WalletConnectionState> = {},
+): WalletConnectionState {
+  return { ...walletState(address), ...overrides };
+}
+
 function Providers({
   children,
   options,
@@ -43,7 +61,7 @@ function Providers({
   children: ReactNode;
   options: RouteRenderOptions;
 }) {
-  const { address = TEST_ADDRESS, swrFallback } = options;
+  const { address = TEST_ADDRESS, swrFallback, wallet } = options;
 
   return (
     <SWRConfig
@@ -59,7 +77,7 @@ function Providers({
         revalidateOnReconnect: false,
       }}
     >
-      <WalletContext.Provider value={walletState(address)}>
+      <WalletContext.Provider value={mockWalletState(address, wallet)}>
         <LiveRegionProvider>
           <ToastProvider>{children}</ToastProvider>
         </LiveRegionProvider>
@@ -74,4 +92,35 @@ export function renderRoute(
   options: RouteRenderOptions = {},
 ): RenderResult {
   return render(<Providers options={options}>{ui}</Providers>);
+}
+
+/**
+ * Collect the text of every live region currently mounted. Live regions are
+ * identified by their ARIA attributes (`aria-live`, `role="status"`,
+ * `role="alert"`) so announcements can be asserted after an interaction.
+ */
+export function getLiveRegionText(container: HTMLElement = document.body): string[] {
+  const regions = container.querySelectorAll<HTMLElement>(
+    '[aria-live], [role="status"], [role="alert"]',
+  );
+  return Array.from(regions)
+    .map((region) => (region.textContent ?? "").trim())
+    .filter((text) => text.length > 0);
+}
+
+/**
+ * Assert that a live region announced `expected` (substring match) within the
+ * current DOM. Throws with the observed announcements for easier debugging.
+ */
+export function expectAnnouncement(expected: string | RegExp): void {
+  const announcements = getLiveRegionText();
+  const matched = announcements.some((text) =>
+    typeof expected === "string" ? text.includes(expected) : expected.test(text),
+  );
+  if (!matched) {
+    throw new Error(
+      `Expected a live-region announcement matching ${String(expected)}. ` +
+        `Observed announcements: ${JSON.stringify(announcements)}`,
+    );
+  }
 }

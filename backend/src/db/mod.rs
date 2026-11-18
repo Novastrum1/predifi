@@ -121,6 +121,56 @@ use crate::config::Config;
 
 pub use health::{DependencyHealth, DependencyStatus, ReadinessReport};
 
+// ── Connection budget ─────────────────────────────────────────────────────────
+
+/// Maximum number of PostgreSQL connections reserved for administration
+/// (migrations, `psql` sessions, monitoring) on top of the service budget.
+pub const ADMIN_CONNECTION_HEADROOM: u32 = 10;
+
+/// Compute the global connection budget for a deployment.
+///
+/// The budget is the database's `max_connections` minus a fixed headroom for
+/// administration. Every service pool must fit inside this budget so that
+/// scaling or rolling deployments cannot exhaust the database.
+pub fn global_connection_budget(db_max_connections: u32) -> u32 {
+    db_max_connections.saturating_sub(ADMIN_CONNECTION_HEADROOM)
+}
+
+/// Error returned when a pool configuration would exceed the global budget.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConnectionBudgetError {
+    /// Connections requested by this pool.
+    pub requested: u32,
+    /// Total connections allowed across all services.
+    pub budget: u32,
+}
+
+impl std::fmt::Display for ConnectionBudgetError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "pool max_connections ({}) exceeds global connection budget ({})",
+            self.requested, self.budget
+        )
+    }
+}
+
+impl std::error::Error for ConnectionBudgetError {}
+
+/// Validate that a pool requesting `requested` connections fits within the
+/// global budget derived from `db_max_connections`.
+pub fn check_connection_budget(
+    requested: u32,
+    db_max_connections: u32,
+) -> Result<(), ConnectionBudgetError> {
+    let budget = global_connection_budget(db_max_connections);
+    if requested > budget {
+        Err(ConnectionBudgetError { requested, budget })
+    } else {
+        Ok(())
+    }
+}
+
 // ── Pool creation error ───────────────────────────────────────────────────────
 
 /// Error returned when the database pool cannot be created after all retries.
@@ -167,6 +217,21 @@ pub fn is_transient_error(err: &sqlx::Error) -> bool {
 /// `db_connect_max_delay_ms`) are all validated at startup by
 /// [`crate::config::Config::validate`].
 pub async fn create_pool(config: &Config) -> Result<PgPool, PoolCreationError> {
+    // Refuse to build a pool that would blow the global connection budget.
+    if let Err(budget_err) =
+        check_connection_budget(config.db_max_connections, config.db_max_connections)
+    {
+        error!(
+            requested = budget_err.requested,
+            budget = budget_err.budget,
+            "refusing to create database pool: connection budget exceeded"
+        );
+        return Err(PoolCreationError {
+            last_error: sqlx::Error::Configuration(Box::new(budget_err)),
+            attempts: 0,
+        });
+    }
+
     let connect = || async {
         let future = PgPoolOptions::new()
             .max_connections(config.db_max_connections)
@@ -322,6 +387,30 @@ mod tests {
         let config = crate::config::Config::default_for_test();
         assert!(config.db_connect_timeout_secs > 0, "connect timeout must be > 0");
         assert!(config.db_acquire_timeout_secs > 0, "acquire timeout must be > 0");
+    }
+
+    #[test]
+    fn global_budget_reserves_admin_headroom() {
+        assert_eq!(global_connection_budget(100), 100 - ADMIN_CONNECTION_HEADROOM);
+        assert_eq!(global_connection_budget(5), 0, "budget saturates at zero");
+    }
+
+    #[test]
+    fn connection_budget_rejects_oversized_pool() {
+        assert!(check_connection_budget(50, 100).is_ok());
+        let err = check_connection_budget(200, 100).unwrap_err();
+        assert_eq!(err.requested, 200);
+        assert_eq!(err.budget, global_connection_budget(100));
+        assert!(err.to_string().contains("exceeds global connection budget"));
+    }
+
+    #[tokio::test]
+    async fn create_pool_refuses_unsafe_configuration() {
+        let mut config = crate::config::Config::default_for_test();
+        config.db_max_connections = config.db_max_connections.saturating_add(1_000);
+        let result = create_pool(&config).await;
+        let err = result.expect_err("oversized pool must be rejected");
+        assert_eq!(err.attempts, 0, "budget check must fail before connecting");
     }
 
     #[test]

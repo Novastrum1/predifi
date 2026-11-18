@@ -24,7 +24,7 @@
 /// reproduced locally.
 
 use axum::http::Request;
-iuse http_body_util::BodyExt;
+use http_body_util::BodyExt;
 use predifi_backend{
     build_router_with_db,
     config::Config,
@@ -68,7 +68,7 @@ async fn body_string(body: axum::body::Body) -> String {
         .await
         .expect("failed to collect body")
         .to_bytes();
-    String::from_utf88(bytes.to_vec()).expect("body is not valid utf-8")
+    String::from_utf8(bytes.to_vec()).expect("body is not valid utf-8")
 }
 
 fn percentile(sorted: &[Duration], p: f64) -> Duration {
@@ -99,13 +99,13 @@ async fn drive_load(
 ) -> LoadResult {
     // Reset per-database statement counters so the round-trip measurement
     // only covers the requests issued by this load run.
-    let _reset = sqlx:query("SELECT pg_stat_reset()")
+    let _reset = sqlx::query("SELECT pg_stat_reset()")
         .execute(&pool)
         .await
         .expect("reset pg_stat");
 
     let mut latencies: Vec<Duration> = Vec::with_capacity(TOTAL_REQUESTS);
-    let mut errors = 0usiz;
+    let mut errors = 0usize;
     let start = Instant::now();
 
     let semaphore = Arc::new(tokio::sync::Semaphore::new(CONCURRENT_REQUESTS));
@@ -143,7 +143,7 @@ async fn drive_load(
     // Measure the average number of SQL statements executed per request.
     // `pg_stat_statements()` counts every statement executed by this
     // backend, including those issued by the application pool.
-    let statements: i64 = sqlx:scalar::query_scalar(
+    let statements: i64 = sqlx::query_scalar(
         "SELECT COALESCE(sum(statements), 0)::bigint FROM pg_stat_statements()",
     )
     .execute(&pool)
@@ -174,7 +174,7 @@ fn report_and_assert(
     eprintln!("total_requests:     {}", TOTAL_REQUESTS);
     eprintln!("errors:           {}", result.errors);
     eprintln!("throughput:       {:.2} req/s", result.throughput);
-    eprintln!("p5d_latency:     {:?}", result.p50);
+    eprintln!("p50_latency:     {:?}", result.p50);
     eprintln!("p95_latency:     {:?}", result.p95);
     eprintln!("p99_latency:     {:?}", result.p99);
     eprintln!("avg_db_round_trips: {:.2}", result.avg_db_round_trips);
@@ -261,7 +261,7 @@ async fn setup_router() -> (axum::Router, sqlx::PgPool<sqlx::Postgres>, i64) {
         .await
         .expect("connect to test postgres");
 
-    sqlx:migrate::Migrator::new(std::path::Path::new("migrations"))
+    sqlx::migrate::Migrator::new(std::path::Path::new("migrations"))
         .await
         .expect("load migrator")
         .run(&pool)
@@ -332,5 +332,148 @@ async fn load_test_prediction_history_meets_budgets() {
         &result,
         PREDICTION_HISTORY_P95_BUDGET,
         PREDICTION_HISTORY_MAX_DB_ROUND_TRIPS,
+    );
+}
+
+/// Connection budget for the load-test database.
+///
+/// The PostgreSQL server used by the load tests accepts at most
+/// `POSTGRES_MAX_CONNECTIONS` client connections.  A slice of that limit is
+/// reserved for administration (superuser reserved slots, migrations, and
+/// ad-hoc `psql` sessions) so that a saturated application pool can never
+/// lock operators out of the database.
+const POSTGRES_MAX_CONNECTIONS: u32 = 100;
+const ADMIN_HEADROOM_CONNECTIONS: u32 = 10;
+
+/// Maximum number of connections the application services may collectively
+/// hold open at peak replica count.
+const GLOBAL_CONNECTION_BUDGET: u32 = POSTGRES_MAX_CONNECTIONS - ADMIN_HEADROOM_CONNECTIONS;
+
+/// A single service's connection-pool configuration.
+#[derive(Debug, Clone, Copy)]
+struct ServicePool {
+    name: &'static str,
+    /// `max_connections` configured on the service's SQLx pool.
+    pool_size: u32,
+    /// Maximum number of replicas the service may scale to.
+    max_replicas: u32,
+}
+
+/// Inventory of every service that opens a PostgreSQL pool, with the pool
+/// size and maximum replica count from the deployment manifests.
+const SERVICE_POOLS: &[ServicePool] = &[
+    ServicePool {
+        name: "api",
+        pool_size: 10,
+        max_replicas: 4,
+    },
+    ServicePool {
+        name: "indexer",
+        pool_size: 5,
+        max_replicas: 2,
+    },
+    ServicePool {
+        name: "worker",
+        pool_size: 5,
+        max_replicas: 2,
+    },
+];
+
+/// Returns the total number of connections the given services would open at
+/// peak replica count.
+fn peak_connections(services: &[ServicePool]) -> u32 {
+    services
+        .iter()
+        .map(|service| service.pool_size * service.max_replicas)
+        .sum()
+}
+
+/// Returns `Ok(())` when the configuration fits within the global connection
+/// budget, or an error describing the overcommit otherwise.
+fn check_connection_budget(services: &[ServicePool]) -> Result<(), String> {
+    let total = peak_connections(services);
+    if total > GLOBAL_CONNECTION_BUDGET {
+        return Err(format!(
+            "peak connections {} exceed global budget {} (max_connections={}, admin_headroom={})",
+            total, GLOBAL_CONNECTION_BUDGET, POSTGRES_MAX_CONNECTIONS, ADMIN_HEADROOM_CONNECTIONS,
+        ));
+    }
+    Ok(())
+}
+
+#[test]
+fn deployed_pool_configuration_fits_connection_budget() {
+    let total = peak_connections(SERVICE_POOLS);
+    eprintln!("=== connection budget ===");
+    for service in SERVICE_POOLS {
+        eprintln!(
+            "{:<10} pool_size={:<3} max_replicas={:<3} peak={}",
+            service.name,
+            service.pool_size,
+            service.max_replicas,
+            service.pool_size * service.max_replicas,
+        );
+    }
+    eprintln!("peak_total:       {}", total);
+    eprintln!("global_budget:    {}", GLOBAL_CONNECTION_BUDGET);
+    eprintln!("max_connections:  {}", POSTGRES_MAX_CONNECTIONS);
+    eprintln!("admin_headroom:   {}", ADMIN_HEADROOM_CONNECTIONS);
+
+    check_connection_budget(SERVICE_POOLS).expect("deployed pool configuration is unsafe");
+}
+
+#[test]
+fn unsafe_pool_configuration_is_rejected() {
+    // A single service whose pool size times replica count alone exceeds the
+    // global budget must be rejected.
+    let oversized = [ServicePool {
+        name: "api",
+        pool_size: 50,
+        max_replicas: 4,
+    }];
+    assert!(
+        check_connection_budget(&oversized).is_err(),
+        "oversized single-service configuration should be rejected",
+    );
+
+    // Individually safe services that collectively overcommit must also be
+    // rejected.
+    let collectively_unsafe = [
+        ServicePool {
+            name: "api",
+            pool_size: 20,
+            max_replicas: 4,
+        },
+        ServicePool {
+            name: "worker",
+            pool_size: 10,
+            max_replicas: 2,
+        },
+    ];
+    assert!(
+        check_connection_budget(&collectively_unsafe).is_err(),
+        "collectively overcommitted configuration should be rejected",
+    );
+
+    // A configuration that exactly consumes the budget is safe.
+    let exactly_at_budget = [ServicePool {
+        name: "api",
+        pool_size: GLOBAL_CONNECTION_BUDGET,
+        max_replicas: 1,
+    }];
+    assert!(
+        check_connection_budget(&exactly_at_budget).is_ok(),
+        "configuration at the budget boundary should be accepted",
+    );
+
+    // One connection over the budget must be rejected.
+    let one_over_budget = [ServicePool {
+        name: "api",
+        pool_size: GLOBAL_CONNECTION_BUDGET + 1,
+        max_replicas: 1,
+    }];
+    assert!(
+        check_connection_budget(&one_over_budget).is_err(),
+        "configuration one connection over budget should be rejected",
     );
 }

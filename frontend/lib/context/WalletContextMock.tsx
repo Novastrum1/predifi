@@ -34,6 +34,7 @@ import {
   useEffect,
   useMemo,
   useRef,
+  useState,
   type ReactNode,
 } from "react";
 import { useSWRConfig } from "swr";
@@ -159,3 +160,238 @@ export function useWalletAddress(): string | undefined {
 
 // Re-export the state type so consumers don't need to import from the hook.
 export type { WalletConnectionState };
+
+// ── Deterministic test mock ───────────────────────────────────────────────────
+
+/**
+ * Lifecycle phases a mocked wallet can be driven through by the accessibility
+ * journey tests. Each phase maps to a deterministic, extension-free state so
+ * focus restoration and live-region announcements can be asserted reliably.
+ *
+ *   idle       — no wallet connected
+ *   connecting — connection in flight (spinner / aria-busy assertions)
+ *   connected  — address available, ready to sign
+ *   signing    — signature request pending (dialog focus assertions)
+ *   signed     — signature produced successfully
+ *   rejected   — user rejected the signature request
+ *   error      — connection or signing failed
+ *   recovered  — error cleared, wallet usable again
+ */
+export type MockWalletPhase =
+  | "idle"
+  | "connecting"
+  | "connected"
+  | "signing"
+  | "signed"
+  | "rejected"
+  | "error"
+  | "recovered";
+
+export interface MockWalletControls {
+  /** Current deterministic phase. */
+  phase: MockWalletPhase;
+  /** Address exposed while connected (undefined otherwise). */
+  address: string | undefined;
+  /** Last signature produced by `sign`, if any. */
+  signature: string | undefined;
+  /** Drive the mock to an arbitrary phase. */
+  setPhase: (phase: MockWalletPhase) => void;
+  /** Simulate a successful connect. */
+  connect: () => void;
+  /** Simulate a disconnect back to `idle`. */
+  disconnect: () => void;
+  /** Simulate a pending signature request. */
+  sign: () => void;
+  /** Simulate the user rejecting the signature request. */
+  reject: () => void;
+  /** Simulate a failure. */
+  fail: (message?: string) => void;
+  /** Clear any error and return to a usable state. */
+  recover: () => void;
+}
+
+export const MOCK_WALLET_ADDRESS =
+  "0x000000000000000000000000000000000000dEaD";
+export const MOCK_WALLET_SIGNATURE = "0x" + "ab".repeat(65);
+export const MOCK_WALLET_ERROR = "Mock wallet error";
+
+const MockWalletControlsContext = createContext<
+  MockWalletControls | undefined
+>(undefined);
+MockWalletControlsContext.displayName = "MockWalletControlsContext";
+
+/**
+ * useMockWalletControls — access the deterministic mock driver.
+ *
+ * Only available inside <MockWalletProvider>; throws otherwise so tests fail
+ * loudly if the mock is wired up incorrectly.
+ */
+export function useMockWalletControls(): MockWalletControls {
+  const ctx = useContext(MockWalletControlsContext);
+  if (ctx === undefined) {
+    throw new Error(
+      "useMockWalletControls must be used within a <MockWalletProvider>.",
+    );
+  }
+  return ctx;
+}
+
+/**
+ * MockWalletProvider — deterministic, extension-free replacement for
+ * <WalletProvider> used by the accessibility journey tests.
+ *
+ * It exposes the same WalletContext contract as the real provider, so
+ * components under test behave identically, while the connect / sign /
+ * reject / fail / recover transitions are driven synchronously by the test.
+ */
+export function MockWalletProvider({
+  children,
+  initialPhase = "idle",
+}: {
+  children: ReactNode;
+  initialPhase?: MockWalletPhase;
+}) {
+  const { mutate } = useSWRConfig();
+  const { network } = useNetwork();
+
+  const [phase, setPhaseState] = useState<MockWalletPhase>(initialPhase);
+  const [signature, setSignature] = useState<string | undefined>(undefined);
+  const [error, setError] = useState<string | undefined>(undefined);
+
+  const address =
+    phase === "idle" || phase === "connecting" || phase === "error"
+      ? undefined
+      : MOCK_WALLET_ADDRESS;
+
+  const identityKey = useMemo(
+    () => `${network}:${address ?? ""}`,
+    [network, address],
+  );
+
+  const generationRef = useRef(0);
+  const prevIdentityRef = useRef<string>(identityKey);
+
+  useEffect(() => {
+    const prev = prevIdentityRef.current;
+    if (prev !== identityKey) {
+      generationRef.current += 1;
+      void mutate(() => true, undefined, { revalidate: false });
+      prevIdentityRef.current = identityKey;
+    }
+  }, [identityKey, mutate]);
+
+  const setPhase = useCallback((next: MockWalletPhase) => {
+    setPhaseState(next);
+    if (next === "signed") {
+      setSignature(MOCK_WALLET_SIGNATURE);
+    }
+    if (next === "rejected") {
+      setError("Signature request rejected");
+    }
+    if (next === "error") {
+      setError(MOCK_WALLET_ERROR);
+    }
+    if (next === "recovered" || next === "connected" || next === "idle") {
+      setError(undefined);
+    }
+  }, []);
+
+  const connect = useCallback(() => {
+    setPhaseState("connecting");
+    setError(undefined);
+    // Synchronous transition keeps the mock deterministic for tests.
+    setPhaseState("connected");
+  }, []);
+
+  const disconnect = useCallback(() => {
+    setPhaseState("idle");
+    setSignature(undefined);
+    setError(undefined);
+    generationRef.current += 1;
+    void mutate(() => true, undefined, { revalidate: false });
+  }, [mutate]);
+
+  const sign = useCallback(() => {
+    setPhaseState("signing");
+    setPhaseState("signed");
+    setSignature(MOCK_WALLET_SIGNATURE);
+  }, []);
+
+  const reject = useCallback(() => {
+    setPhaseState("rejected");
+    setError("Signature request rejected");
+  }, []);
+
+  const fail = useCallback((message?: string) => {
+    setPhaseState("error");
+    setError(message ?? MOCK_WALLET_ERROR);
+  }, []);
+
+  const recover = useCallback(() => {
+    setPhaseState("recovered");
+    setError(undefined);
+  }, []);
+
+  const clearError = useCallback(() => {
+    setError(undefined);
+    setPhaseState((prev) => (prev === "error" ? "recovered" : prev));
+  }, []);
+
+  const value = useMemo<WalletConnectionState>(
+    () => ({
+      address,
+      isConnecting: phase === "connecting",
+      error,
+      requiredNetworkLabel: undefined,
+      connect,
+      disconnect,
+      clearError,
+      identityKey,
+      generation: generationRef.current,
+    }),
+    [
+      address,
+      phase,
+      error,
+      connect,
+      disconnect,
+      clearError,
+      identityKey,
+    ],
+  );
+
+  const controls = useMemo<MockWalletControls>(
+    () => ({
+      phase,
+      address,
+      signature,
+      setPhase,
+      connect,
+      disconnect,
+      sign,
+      reject,
+      fail,
+      recover,
+    }),
+    [
+      phase,
+      address,
+      signature,
+      setPhase,
+      connect,
+      disconnect,
+      sign,
+      reject,
+      fail,
+      recover,
+    ],
+  );
+
+  return (
+    <MockWalletControlsContext.Provider value={controls}>
+      <WalletContext.Provider value={value}>
+        {children}
+      </WalletContext.Provider>
+    </MockWalletControlsContext.Provider>
+  );
+}

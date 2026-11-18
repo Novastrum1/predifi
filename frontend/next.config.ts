@@ -1,7 +1,14 @@
 import type { NextConfig } from "next";
 import { securityHeaders } from "./lib/securityHeaders";
+import { buildProvenance } from "./lib/buildProvenance";
 
 const nextConfig: NextConfig = {
+  // Pin build inputs and record provenance (git revision, lockfile hash,
+  // artifact digest) so a release can be traced to reviewed source.
+  generateBuildId: async () => buildProvenance.buildId,
+  env: {
+    NEXT_PUBLIC_BUILD_PROVENANCE: JSON.stringify(buildProvenance),
+  },
   async headers() {
     return [
       {

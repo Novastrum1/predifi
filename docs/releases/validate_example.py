@@ -30,6 +30,24 @@ def validate(example):
         require(build_wf.get("id") is not None, "missing build workflow id")
         require(build_wf.get("run_id") is not None, "missing build workflow run_id")
         require(example["build"].get("toolchain") is not None, "missing build toolchain")
+    if "frontend_build" in example:
+        frontend = example["frontend_build"]
+        require(frontend.get("source_revision") is not None,
+                "missing frontend source revision")
+        require(frontend["source_revision"] == source["commit"],
+                "frontend source revision mismatch")
+        require(re.fullmatch(r"[0-9a-f]{64}", frontend.get("lockfile_sha256") or ""),
+                "invalid frontend lockfile hash")
+        require(re.fullmatch(r"[0-9a-f]{64}", frontend.get("artifact_sha256") or ""),
+                "invalid frontend artifact digest")
+        require(frontend.get("toolchain") is not None,
+                "missing frontend build toolchain")
+        require(frontend.get("reproducible") is True,
+                "frontend build not marked reproducible")
+        if "repeated_build_sha256" in frontend:
+            require(frontend["repeated_build_sha256"] == frontend["artifact_sha256"],
+                    "frontend repeated build digest mismatch")
+=======
     artifacts = {item["id"]: item for item in example["artifacts"]}
     require(len(artifacts) == len(example["artifacts"]), "duplicate artifact ID")
     require(set(artifacts) == {"access-control", "predifi-contract"}, "missing artifact")
@@ -98,6 +116,30 @@ def main():
         print("PASS: rejected missing build toolchain")
     else:
         raise ValueError("failed to reject missing build toolchain")
+
+    # Negative test cases for frontend build provenance
+    if "frontend_build" in example:
+        frontend_cases = [
+            ("source_revision", None, "missing frontend source revision"),
+            ("source_revision", "2" * 40, "frontend source revision mismatch"),
+            ("lockfile_sha256", None, "invalid frontend lockfile hash"),
+            ("lockfile_sha256", "not-a-hash", "invalid frontend lockfile hash"),
+            ("artifact_sha256", None, "invalid frontend artifact digest"),
+            ("artifact_sha256", "0" * 63, "invalid frontend artifact digest"),
+            ("toolchain", None, "missing frontend build toolchain"),
+            ("reproducible", False, "frontend build not marked reproducible"),
+            ("repeated_build_sha256", "0" * 64, "frontend repeated build digest mismatch"),
+        ]
+        for key, value, expected in frontend_cases:
+            changed_frontend = copy.deepcopy(example)
+            changed_frontend["frontend_build"][key] = value
+            try:
+                validate(changed_frontend)
+            except ValueError as error:
+                require(str(error) == expected, f"unexpected rejection: {error}")
+                print(f"PASS: rejected {expected}")
+            else:
+                raise ValueError(f"failed to reject {expected}")
     print("No WASM executed and no network deployment performed.")
 
 

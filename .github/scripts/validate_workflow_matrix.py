@@ -390,6 +390,50 @@ def check_docs_only(
     report.ok("docs-only changes schedule no component workflows")
 
 
+def check_required_workflows(
+    matrix: dict[str, Any],
+    workflows: dict[str, dict[str, Any]],
+    report: Report,
+) -> None:
+    """Workflows that must never be silently skipped by path filters.
+
+    A required workflow (for example the browser/device smoke suite) must be
+    registered in the matrix and must trigger on every integration branch for
+    both ``push`` and ``pull_request`` without narrowing ``paths`` or
+    ``paths-ignore`` filters, otherwise a regression in the critical flow set
+    could merge unnoticed.
+    """
+    required = matrix.get("required_workflows") or []
+    for entry in required:
+        name = entry["workflow"]
+        workflow = workflows.get(name)
+        if workflow is None:
+            report.error(
+                f"required workflow {name!r} is not registered in the workflow matrix"
+            )
+            continue
+        config = on_config(workflow)
+        for event in EVENTS:
+            event_config = config.get(event)
+            if not isinstance(event_config, dict):
+                report.error(
+                    f"required workflow {name!r}: '{event}' has no filters; "
+                    "it must declare branches and run on all files"
+                )
+                continue
+            if as_list(event_config.get("paths")):
+                report.error(
+                    f"required workflow {name!r}: '{event}' narrows 'paths'; "
+                    "a required workflow must run for every change"
+                )
+            if as_list(event_config.get("paths-ignore")):
+                report.error(
+                    f"required workflow {name!r}: '{event}' narrows "
+                    "'paths-ignore'; a required workflow must run for every change"
+                )
+    report.ok(f"required workflows: {len(required)} verified as always-on")
+
+
 def check_deploy_gates(
     matrix: dict[str, Any],
     workflows: dict[str, dict[str, Any]],
@@ -472,6 +516,7 @@ def main() -> int:
         check_boundaries(matrix, workflows, branch_report)
         rows = check_fixtures(matrix, workflows, branch_report, branch)
         check_docs_only(matrix, workflows, branch_report)
+        check_required_workflows(matrix, workflows, branch_report)
         check_deploy_gates(matrix, workflows, branch_report)
 
         for note in branch_report.notes:

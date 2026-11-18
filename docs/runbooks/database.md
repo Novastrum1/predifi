@@ -4,6 +4,53 @@ PostgreSQL runs on RDS (`terraform/modules/postgres` via the root module). The
 backend uses an `sqlx::PgPool` sized by `PREDIFI_DB_MAX_CONNECTIONS` (default
 10 per instance).
 
+## Connection budget
+
+Every service that opens a pool counts against the RDS `max_connections`
+limit. During a rolling deploy or a scale-out, old and new replicas overlap, so
+the budget must be computed from **peak** replica counts, not steady state.
+
+Inventory (keep this table in sync with the Terraform variables and the
+`PREDIFI_DB_MAX_CONNECTIONS` defaults):
+
+| Service | Pool size per replica | Max replicas (steady) | Peak replicas (rolling deploy) | Peak connections |
+| --- | --- | --- | --- | --- |
+| backend | `PREDIFI_DB_MAX_CONNECTIONS` (10) | `backend_max_replicas` (6) | steady + `backend_max_surge` (2) = 8 | 80 |
+| indexer | `PREDIFI_DB_MAX_CONNECTIONS` (5) | `indexer_max_replicas` (2) | steady + `indexer_max_surge` (1) = 3 | 15 |
+| migrations / jobs | 1 per job | 1 | 2 (overlapping deploy + manual run) | 2 |
+| **Total application** | | | | **97** |
+
+Global budget: **application peak connections must stay at or below 80% of
+RDS `max_connections`**, leaving at least 20% headroom for administration
+(bastion sessions, `pg_dump`/restore, monitoring, RDS maintenance). With the
+default `max_connections` of 150 the ceiling is 120 connections; the inventory
+above (97) fits with 23 connections of margin. Raising any pool size or max
+replica count requires re-checking this table and the RDS parameter.
+
+### Deployment check
+
+`scripts/check_db_connection_budget.sh` (run in CI before deploy and as a
+pre-deploy gate in the release pipeline) reads the pool sizes and replica
+counts from the environment/Terraform outputs, computes the peak connection
+total, and compares it to the RDS `max_connections` limit. It **fails the
+deploy** (non-zero exit) when:
+
+- peak application connections exceed 80% of `max_connections`, or
+- the computed total exceeds `max_connections` outright, or
+- a pool size or replica count is missing/unparseable (no silent defaults).
+
+To validate a change, run it against the staging profile with peak replica
+counts:
+
+```bash
+PREDIFI_ENV=staging scripts/check_db_connection_budget.sh
+```
+
+The script prints the per-service breakdown, the calculated maximum, and the
+remaining headroom. If it fails, lower a pool size or max replica count, or
+raise RDS `max_connections` (and re-verify memory headroom on the instance
+class) before merging.
+
 > **Known gap:** `db_pool_utilization_ratio` is documented in
 > `backend/src/db/README.md` but not registered in `backend/src/metrics.rs`.
 > Until it is, the two pool alerts below have no data; use the
@@ -50,7 +97,10 @@ burst of traffic or one slow query will start queueing requests.
 1. **Stuck query:** `SELECT pg_cancel_backend(<pid>);`
 2. **Legitimate traffic growth:** add a backend instance (more pools) before
    raising `PREDIFI_DB_MAX_CONNECTIONS`. Check RDS `max_connections` first:
-   instances × pool size must stay below it with headroom for operators.
+   instances × pool size must stay below it with headroom for operators. Run
+   `scripts/check_db_connection_budget.sh` (see
+   [Connection budget](#connection-budget)) to confirm the new peak stays
+   within the global budget.
 
 **Verification:** Utilization drops below 80% for 10 minutes.
 
@@ -90,8 +140,9 @@ with 5xx. Expect `HighApiErrorRate` and `HighP99Latency` to follow.
    [`docs/MIGRATION_DEPLOYMENT_GUIDE.md`](../MIGRATION_DEPLOYMENT_GUIDE.md)
    before retrying it.
 3. **Traffic spike:** add backend instances only if RDS has spare
-   `max_connections`; otherwise shed load at the load balancer (rate limiting)
-   rather than adding connections.
+   `max_connections` (verify with
+   `scripts/check_db_connection_budget.sh`); otherwise shed load at the load
+   balancer (rate limiting) rather than adding connections.
 
 **Verification:** Utilization below 80%, API 5xx rate back under 1%.
 

@@ -8,7 +8,59 @@ on:
     paths:
       - 'backend/**'
 
+env:
+  # PostgreSQL connection limit for the load-test database.
+  POSTGRES_MAX_CONNECTIONS: 100
+  # Reserved connections for administration, migrations and monitoring.
+  DB_ADMIN_HEADROOM: 10
+  # Per-service pool sizes and maximum replica counts (inventory).
+  # Format: "service:pool_size:max_replicas"
+  DB_POOL_INVENTORY: |
+    backend:50:1
+    worker:10:2
+    scheduler:5:1
+
 jobs:
+  connection-budget:
+    name: Check Database Connection Budget
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Verify connection budget across peak replicas
+        env:
+          PREDIFI_DB_MAX_CONNECTIONS: 50
+        run: |
+          set -euo pipefail
+          max_conn="${POSTGRES_MAX_CONNECTIONS}"
+          headroom="${DB_ADMIN_HEADROOM}"
+          budget=$(( max_conn - headroom ))
+          echo "PostgreSQL limit: ${max_conn}, admin headroom: ${headroom}, usable budget: ${budget}"
+
+          total=0
+          while IFS=: read -r service pool replicas; do
+            [ -z "${service}" ] && continue
+            service_total=$(( pool * replicas ))
+            echo "  ${service}: pool=${pool} x replicas=${replicas} = ${service_total}"
+            total=$(( total + service_total ))
+          done <<< "${DB_POOL_INVENTORY}"
+
+          echo "Total peak connections: ${total} (budget ${budget})"
+          if [ "${total}" -gt "${budget}" ]; then
+            echo "::error::Unsafe configuration: ${total} connections exceed budget of ${budget} (limit ${max_conn} - headroom ${headroom})"
+            exit 1
+          fi
+
+          # Also validate the configured backend pool against the budget.
+          if [ "${PREDIFI_DB_MAX_CONNECTIONS}" -gt "${budget}" ]; then
+            echo "::error::PREDIFI_DB_MAX_CONNECTIONS=${PREDIFI_DB_MAX_CONNECTIONS} exceeds budget of ${budget}"
+            exit 1
+          fi
+          echo "Connection budget check passed."
+
   capacity-test:
     name: Run Capacity Load Test
     runs-on: ubuntu-latest
@@ -69,6 +121,33 @@ jobs:
         run: |
           cargo run --release &
           sleep 5 # Wait for Axum to bind to port 3000
+
+      - name: Exercise Peak Replica Connection Budget (staging profile)
+        env:
+          PREDIFI_DB_MAX_CONNECTIONS: 50
+          PREDIFI_STAGING_PROFILE: "1"
+        run: |
+          set -euo pipefail
+          max_conn="${POSTGRES_MAX_CONNECTIONS}"
+          headroom="${DB_ADMIN_HEADROOM}"
+          budget=$(( max_conn - headroom ))
+          # Staging profile exercises peak replica counts for every service.
+          staging_inventory="backend:50:2
+worker:10:4
+scheduler:5:2"
+          total=0
+          while IFS=: read -r service pool replicas; do
+            [ -z "${service}" ] && continue
+            service_total=$(( pool * replicas ))
+            echo "  ${service}: pool=${pool} x peak replicas=${replicas} = ${service_total}"
+            total=$(( total + service_total ))
+          done <<< "${staging_inventory}"
+          echo "Staging peak connections: ${total} (budget ${budget})"
+          if [ "${total}" -gt "${budget}" ]; then
+            echo "::error::Unsafe staging configuration: ${total} connections exceed budget of ${budget}"
+            exit 1
+          fi
+          echo "Staging peak replica budget check passed."
 
       - name: Execute Load Test
         env:

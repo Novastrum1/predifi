@@ -1,8 +1,39 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
+import { readFile, readdir } from "node:fs/promises";
+import { join, relative, sep } from "node:path";
 import { test } from "node:test";
 
 // Run against `next build && next start`, never the development server.
 const base = process.env.SECURITY_TEST_URL ?? "http://localhost:3000";
+
+// Reproducible-build provenance: set by the CI job that builds twice in
+// isolated environments and compares the recorded metadata and digests.
+const provenancePath = process.env.BUILD_PROVENANCE_PATH;
+const buildDir = process.env.BUILD_OUTPUT_DIR ?? ".next";
+
+async function listFiles(root) {
+  const entries = await readdir(root, { withFileTypes: true });
+  const files = [];
+  for (const entry of entries) {
+    const path = join(root, entry.name);
+    if (entry.isDirectory()) files.push(...(await listFiles(path)));
+    else if (entry.isFile()) files.push(path);
+  }
+  return files;
+}
+
+async function digestBuild(root) {
+  const files = (await listFiles(root)).sort();
+  const hash = createHash("sha256");
+  for (const file of files) {
+    hash.update(relative(root, file).split(sep).join("/"));
+    hash.update("\0");
+    hash.update(await readFile(file));
+    hash.update("\0");
+  }
+  return { digest: hash.digest("hex"), files: files.length };
+}
 
 test("production HTML uses fresh nonces matching its scripts and styles", async () => {
   let previous;
@@ -58,6 +89,22 @@ test("generated market previews remain PNG responses with security headers", asy
     new Uint8Array(await missing.arrayBuffer()),
     "Seed SECURITY_TEST_POOL_ID in the test backend; a fallback PNG does not validate a populated market preview",
   );
+});
+
+test("build provenance records pinned inputs and a stable artifact digest", async (t) => {
+  if (!provenancePath) {
+    t.skip("BUILD_PROVENANCE_PATH not set; provenance is verified by the release CI job");
+    return;
+  }
+  const provenance = JSON.parse(await readFile(provenancePath, "utf8"));
+  assert.match(provenance.sourceRevision, /^[0-9a-f]{40}$/);
+  assert.match(provenance.lockfileHash, /^[0-9a-f]{64}$/);
+  assert.match(provenance.artifactDigest, /^[0-9a-f]{64}$/);
+  assert.match(provenance.toolchain?.node, /^v\d+\.\d+\.\d+$/);
+  assert.match(provenance.toolchain?.packageManager, /^npm@\d+\.\d+\.\d+$/);
+  const { digest, files } = await digestBuild(buildDir);
+  assert.ok(files > 0);
+  assert.equal(digest, provenance.artifactDigest, "artifact digest must match the recorded provenance");
 });
 
 test("middleware-skipped responses cannot drop the fallback security policy", async () => {

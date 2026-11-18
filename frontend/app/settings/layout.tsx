@@ -24,5 +24,9 @@ export const metadata: Metadata = {
 };
 
 export default function SettingsLayout({ children }: { children: React.ReactNode }) {
-  return <>{children}</>;
+  return (
+    <main id="main-content" tabIndex={-1} aria-label="Settings">
+      {children}
+    </main>
+  );
 }

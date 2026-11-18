@@ -17,6 +17,7 @@
  * the client keeps it fresh.
  */
 
+import { useCallback, useRef, useState } from "react";
 import Link from "next/link";
 import useSWR from "swr";
 import { ArrowLeft } from "lucide-react";
@@ -57,6 +58,37 @@ export function PoolDetailClient({ poolId, initialPool }: PoolDetailClientProps)
     fetchPoolDetail,
     { fallbackData: initialPool ?? undefined },
   );
+
+  // Dialog state + focus restoration. Each dialog remembers the control that
+  // opened it so focus can be returned there on close (keyboard journeys).
+  const [activeDialog, setActiveDialog] = useState<"trade" | "claim" | null>(
+    null,
+  );
+  const [announcement, setAnnouncement] = useState("");
+  const tradeTriggerRef = useRef<HTMLButtonElement | null>(null);
+  const claimTriggerRef = useRef<HTMLButtonElement | null>(null);
+
+  const openDialog = useCallback((dialog: "trade" | "claim") => {
+    setActiveDialog(dialog);
+    setAnnouncement(
+      dialog === "trade"
+        ? "Trade confirmation dialog opened."
+        : "Claim dialog opened.",
+    );
+  }, []);
+
+  const closeDialog = useCallback(() => {
+    const trigger =
+      activeDialog === "trade" ? tradeTriggerRef.current : claimTriggerRef.current;
+    setActiveDialog(null);
+    setAnnouncement(
+      activeDialog === "trade"
+        ? "Trade confirmation dialog closed."
+        : "Claim dialog closed.",
+    );
+    // Restore focus to the triggering control after the dialog unmounts.
+    trigger?.focus();
+  }, [activeDialog]);
 
   const pool = data ?? initialPool ?? undefined;
   const isStale = Boolean(error && pool);
@@ -124,6 +156,16 @@ export function PoolDetailClient({ poolId, initialPool }: PoolDetailClientProps)
   return (
     <div className="min-h-screen bg-[#0A0A0A] p-6 lg:p-8">
       <div className="mx-auto max-w-3xl space-y-6">
+        {/* Live region: announces dialog open/close and wallet-state changes. */}
+        <div
+          role="status"
+          aria-live="polite"
+          aria-atomic="true"
+          className="sr-only"
+        >
+          {announcement}
+        </div>
+
         {isStale && (
           <PartialDataBanner
             message="Showing cached pool data — the pool service is unreachable."
@@ -151,6 +193,61 @@ export function PoolDetailClient({ poolId, initialPool }: PoolDetailClientProps)
             <ShareButton url={shareUrl} title={shareTitle} text={pool.name} />
           </div>
         </div>
+
+        <div className="flex flex-wrap items-center gap-2">
+          <button
+            ref={tradeTriggerRef}
+            type="button"
+            onClick={() => openDialog("trade")}
+            aria-haspopup="dialog"
+            aria-expanded={activeDialog === "trade"}
+            className="inline-flex items-center gap-2 rounded-lg bg-[#7DE3EC] px-4 py-2 text-sm font-semibold text-black transition-colors hover:bg-[#5fd0d8] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#7DE3EC] focus-visible:ring-offset-2 focus-visible:ring-offset-[#0A0A0A]"
+          >
+            Confirm trade
+          </button>
+          <button
+            ref={claimTriggerRef}
+            type="button"
+            onClick={() => openDialog("claim")}
+            aria-haspopup="dialog"
+            aria-expanded={activeDialog === "claim"}
+            className="inline-flex items-center gap-2 rounded-lg border border-zinc-700 bg-zinc-800/50 px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-zinc-800 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-zinc-500"
+          >
+            Claim winnings
+          </button>
+        </div>
+
+        {activeDialog && (
+          <div
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="pool-dialog-title"
+            className="rounded-xl border border-zinc-700 bg-zinc-900 p-5 space-y-3"
+          >
+            <h2
+              id="pool-dialog-title"
+              className="text-sm font-semibold text-white uppercase tracking-wide"
+            >
+              {activeDialog === "trade"
+                ? "Confirm trade"
+                : "Claim winnings"}
+            </h2>
+            <p className="text-sm text-zinc-400">
+              {activeDialog === "trade"
+                ? "Review your position before submitting the trade."
+                : "Review the outcome before claiming your winnings."}
+            </p>
+            <div className="flex items-center gap-2">
+              <button
+                type="button"
+                onClick={closeDialog}
+                className="inline-flex items-center gap-2 rounded-lg border border-zinc-700 bg-zinc-800/50 px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-zinc-800 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-zinc-500"
+              >
+                Cancel
+              </button>
+            </div>
+          </div>
+        )}
 
         <div className="rounded-xl border border-zinc-800 bg-zinc-900 p-5 space-y-3">
           <h2 className="text-sm font-semibold text-white uppercase tracking-wide">

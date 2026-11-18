@@ -46,6 +46,39 @@ export function validateRelease(example) {
     }
   }
 
+  // Verify frontend build provenance and artifact digest policy
+  if (example.frontend != null) {
+    const frontend = example.frontend;
+    requireCond(frontend.source_revision != null, 'missing frontend source revision');
+    requireCond(
+      /^[0-9a-f]{40}$/.test(frontend.source_revision),
+      'invalid frontend source revision'
+    );
+    requireCond(frontend.source_revision === source.commit, 'frontend source revision mismatch');
+    requireCond(frontend.lockfile_hash != null, 'missing frontend lockfile hash');
+    requireCond(/^[0-9a-f]{64}$/.test(frontend.lockfile_hash), 'invalid frontend lockfile hash');
+    requireCond(frontend.toolchain != null, 'missing frontend toolchain');
+    requireCond(frontend.artifact_digest != null, 'missing frontend artifact digest');
+    requireCond(
+      /^sha256:[0-9a-f]{64}$/.test(frontend.artifact_digest),
+      'invalid frontend artifact digest'
+    );
+
+    // Compare the recorded digest against the built artifact when available
+    if (frontend.built_artifact_hex != null) {
+      const builtDigest =
+        'sha256:' +
+        crypto
+          .createHash('sha256')
+          .update(Buffer.from(frontend.built_artifact_hex, 'hex'))
+          .digest('hex');
+      requireCond(
+        builtDigest === frontend.artifact_digest,
+        'frontend artifact digest mismatch'
+      );
+    }
+  }
+
   const artifacts = {};
   for (const item of example.artifacts) {
     requireCond(!artifacts[item.id], 'duplicate artifact ID');
@@ -142,6 +175,30 @@ export function runValidationSuite(targetFile) {
   } catch (err) {
     requireCond(err.message === 'missing build toolchain', `unexpected rejection: ${err.message}`);
     console.log('PASS: rejected missing build toolchain');
+  }
+
+  // Negative test cases: frontend provenance and artifact digest policy
+  if (example.frontend != null) {
+    const frontendCases = [
+      ['source_revision', null, 'missing frontend source revision'],
+      ['source_revision', '2'.repeat(40), 'frontend source revision mismatch'],
+      ['lockfile_hash', null, 'missing frontend lockfile hash'],
+      ['lockfile_hash', 'not-a-hash', 'invalid frontend lockfile hash'],
+      ['toolchain', null, 'missing frontend toolchain'],
+      ['artifact_digest', null, 'missing frontend artifact digest'],
+      ['artifact_digest', 'sha256:' + '0'.repeat(64), 'frontend artifact digest mismatch'],
+    ];
+
+    for (const [key, value, expected] of frontendCases) {
+      const changed = JSON.parse(JSON.stringify(example));
+      changed.frontend[key] = value;
+      try {
+        validateRelease(changed);
+      } catch (err) {
+        requireCond(err.message === expected, `unexpected rejection: ${err.message}`);
+        console.log(`PASS: rejected ${expected}`);
+      }
+    }
   }
 
   console.log('No WASM executed and no network deployment performed.');

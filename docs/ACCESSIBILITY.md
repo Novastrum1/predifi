@@ -59,7 +59,7 @@ Tests query by accessible role and accessible name rather than by internal
 selectors:
 
 - **Status announcements** — query the live region with `getByRole("status")`
-or `getBrole("alert")` and assert on its text content after the state change.
+or `getByRole("alert")` and assert on its text content after the state change.
 - **Polling dedup** — advance timers through several polling ticks with an
 unchanged value and assert the live region text does not change.
 - **Form error association** — query the input by its accessible name, assert
@@ -67,6 +67,73 @@ unchanged value and assert the live region text does not change.
 `aria-describedby`.
 - **Focus preservation** — assert document.activeElement is the expected field
 or the error summary after a failed submit.
+
+## Automated journey tests
+
+Component-level tests cannot see route transitions, dialog focus loss, or
+wallet-state announcements, so the suite in
+`frontend/tests/accessibility/journeys/` drives whole flows. Each journey runs
+twice: once with axe enabled and once keyboard-only.
+
+### Covered journeys
+
+| Journey | Route | What is exercised |
+| --- | --- | --- |
+| Market creation | `/markets/new` | Form labels, validation errors, step navigation, submit confirmation |
+| Trade confirmation | `/markets/[id]` → confirm dialog | Dialog open/close, focus trap, pending → confirmed announcement |
+| Claim | `/dashboard` → claim dialog | Wallet connect, claim submission, success/failure announcement |
+| Settings | `/settings` | Toggles, save confirmation, wallet disconnect announcement |
+
+### axe checks
+
+Every journey runs `axe.run()` on the rendered document after each meaningful
+state change (initial render, dialog open, validation error, success state) and
+fails on any violation of WCAG 2.1 A/AA rules. Route transitions are awaited
+before the scan so the new page, not the outgoing one, is audited.
+
+### Keyboard-only journeys
+
+The keyboard pass uses `userEvent.tab()` / `{Enter}` / `{Escape}` only — no
+`click()` — and asserts:
+
+- **Focus restoration** — after a dialog closes (confirm, claim, or settings
+  save), `document.activeElement` is the element that opened it. After a failed
+  form submit, focus lands on the first invalid field. Assertions compare
+  against the element captured before the dialog opened, not a selector.
+- **Live-region announcements** — after each state change the test reads the
+  live region (`getByRole("status")` / `getByRole("alert")`) and asserts the
+  expected message. Polling ticks with an unchanged value assert the text is
+  unchanged.
+- **Reachability** — the skip link is the first tab stop, and every control in
+  the journey is reachable and operable without a pointer.
+
+### Deterministic wallet mocks
+
+Wallet state is mocked through `frontend/tests/accessibility/mocks/wallet.ts`,
+which replaces the wallet provider with a scripted fake:
+
+- Connection resolves or rejects on a fixed promise, with no network or
+  extension dependency.
+- Balances, chain, and account are fixed fixtures, so announcements and
+  rendered values are stable across runs.
+- Timers are faked (`vi.useFakeTimers()`), so polling and confirmation
+  transitions advance deterministically instead of waiting on real time.
+
+The same mocks are used locally and in CI, so a passing run is reproducible.
+
+### Exclusions
+
+Exclusions are narrowly scoped and each carries a comment naming the rule and
+the reason:
+
+- **Third-party wallet iframe** — the injected wallet UI is outside our DOM
+  control; axe is configured to skip that subtree only.
+- **Colour-contrast on decorative gradients** — the hero gradient behind
+  marketing copy is excluded from the contrast rule; the text on top is still
+  checked.
+
+No other rules are disabled. New exclusions must be justified in the PR that
+adds them.
 
 ## What the audit changed
 
@@ -126,6 +193,9 @@ eslint-config-next includes jsx-a11y rules and catches missing alt text,
 invalid ARIA attributes, and non-interactive elements with handlers. The
 accessibility test suite queries by role and accessible name to cover status
 announcements, polling dedup, form error associations, and focus preservation.
+The journey suite (`pnpm test -- accessibility/journeys`) runs the axe and
+keyboard-only passes over market creation, trade confirmation, claim, and
+settings in CI with the deterministic wallet mocks described above.
 
 Manual passes worth doing before shipping a flow:
 

@@ -15,6 +15,146 @@ use tokio::task::JoinSet;
 const BASE_URL: &str = "http://localhost:3000/api/v1";
 const TEST_ADDRESS: &str = "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA1"; // From seed.rs
 
+/// PostgreSQL's default `max_connections` when the deployment does not override it.
+const DEFAULT_POSTGRES_MAX_CONNECTIONS: usize = 100;
+/// Connections reserved for administration (migrations, psql, monitoring, backups).
+const DEFAULT_ADMIN_HEADROOM: usize = 10;
+/// Per-service pool size used when the environment does not specify one.
+const DEFAULT_POOL_SIZE: usize = 10;
+/// Maximum replica count used when the environment does not specify one.
+const DEFAULT_MAX_REPLICAS: usize = 4;
+
+/// A single service's connection budget: pool size multiplied by peak replicas.
+#[derive(Debug, Clone)]
+struct ServicePool {
+    name: String,
+    pool_size: usize,
+    max_replicas: usize,
+}
+
+impl ServicePool {
+    /// Worst-case connections this service can hold at peak replica count.
+    fn peak_connections(&self) -> usize {
+        self.pool_size.saturating_mul(self.max_replicas)
+    }
+}
+
+fn env_usize(key: &str, default: usize) -> usize {
+    env::var(key)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
+}
+
+/// Inventory of every service that opens a PostgreSQL pool, with its pool size
+/// and maximum replica count. Values are overridable so the staging profile can
+/// be exercised without editing the test.
+fn service_pool_inventory() -> Vec<ServicePool> {
+    vec![
+        ServicePool {
+            name: "api".to_string(),
+            pool_size: env_usize("DB_POOL_SIZE_API", DEFAULT_POOL_SIZE),
+            max_replicas: env_usize("MAX_REPLICAS_API", DEFAULT_MAX_REPLICAS),
+        },
+        ServicePool {
+            name: "indexer".to_string(),
+            pool_size: env_usize("DB_POOL_SIZE_INDEXER", DEFAULT_POOL_SIZE),
+            max_replicas: env_usize("MAX_REPLICAS_INDEXER", DEFAULT_MAX_REPLICAS),
+        },
+        ServicePool {
+            name: "worker".to_string(),
+            pool_size: env_usize("DB_POOL_SIZE_WORKER", DEFAULT_POOL_SIZE),
+            max_replicas: env_usize("MAX_REPLICAS_WORKER", DEFAULT_MAX_REPLICAS),
+        },
+    ]
+}
+
+/// Global connection budget check: the sum of every service's peak connections
+/// plus administrative headroom must stay within the PostgreSQL limit.
+#[tokio::test]
+async fn connection_budget_within_postgres_limit() {
+    let postgres_max = env_usize("POSTGRES_MAX_CONNECTIONS", DEFAULT_POSTGRES_MAX_CONNECTIONS);
+    let admin_headroom = env_usize("DB_ADMIN_HEADROOM", DEFAULT_ADMIN_HEADROOM);
+    let pools = service_pool_inventory();
+
+    let mut total_peak = 0usize;
+    println!(
+        "Connection budget (postgres_max={}, admin_headroom={}):",
+        postgres_max, admin_headroom
+    );
+    for pool in &pools {
+        let peak = pool.peak_connections();
+        total_peak += peak;
+        println!(
+            "  {:<8} pool_size={:<4} max_replicas={:<4} peak_connections={}",
+            pool.name, pool.pool_size, pool.max_replicas, peak
+        );
+    }
+    let required = total_peak + admin_headroom;
+    println!(
+        "  total_peak={} + admin_headroom={} = required={} (limit={})",
+        total_peak, admin_headroom, required, postgres_max
+    );
+
+    assert!(
+        required <= postgres_max,
+        "unsafe connection configuration: services need {} connections at peak \
+         ({} pool + {} admin headroom) but PostgreSQL allows only {}",
+        required,
+        total_peak,
+        admin_headroom,
+        postgres_max
+    );
+}
+
+/// Staging profile: exercise peak replica counts and verify the calculated
+/// maximum connection count remains within the PostgreSQL limit.
+#[tokio::test]
+async fn staging_peak_replicas_within_connection_budget() {
+    if env::var("RUN_CAPACITY_TEST").is_err() {
+        println!("Skipping staging connection budget test. Set RUN_CAPACITY_TEST=1 to run.");
+        return;
+    }
+
+    let postgres_max = env_usize("POSTGRES_MAX_CONNECTIONS", DEFAULT_POSTGRES_MAX_CONNECTIONS);
+    let admin_headroom = env_usize("DB_ADMIN_HEADROOM", DEFAULT_ADMIN_HEADROOM);
+    let pools = service_pool_inventory();
+
+    // Scale every service to its maximum replica count simultaneously.
+    let mut set = JoinSet::new();
+    for pool in pools.clone() {
+        set.spawn(async move {
+            // Simulate the pool being fully saturated at peak replicas.
+            let connections = pool.peak_connections();
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            (pool.name, connections)
+        });
+    }
+
+    let mut total_peak = 0usize;
+    while let Some(res) = set.join_next().await {
+        let (name, connections) = res.expect("peak replica task panicked");
+        println!("  {} reached {} peak connections", name, connections);
+        total_peak += connections;
+    }
+
+    let required = total_peak + admin_headroom;
+    println!(
+        "Staging peak: total_peak={} + admin_headroom={} = required={} (limit={})",
+        total_peak, admin_headroom, required, postgres_max
+    );
+
+    assert!(
+        required <= postgres_max,
+        "staging peak replica configuration is unsafe: {} connections required \
+         ({} pool + {} admin headroom) exceeds PostgreSQL limit of {}",
+        required,
+        total_peak,
+        admin_headroom,
+        postgres_max
+    );
+}
+
 /// Published per-wallet quota for market creation within the abuse window.
 /// Operators can tune this via `ABUSE_MARKET_CREATE_QUOTA` (see docs/abuse-controls.md).
 const DEFAULT_MARKET_CREATE_QUOTA: usize = 5;

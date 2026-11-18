@@ -20,6 +20,7 @@ import {
   useCallback,
   useContext,
   useMemo,
+  useRef,
   useState,
 } from "react";
 
@@ -32,12 +33,19 @@ const AnnouncerContext = createContext<AnnounceFn | null>(null);
 export function LiveRegionProvider({ children }: { children: ReactNode }) {
   const [polite, setPolite] = useState("");
   const [assertive, setAssertive] = useState("");
+  const timeoutRef = useRef<number | null>(null);
 
   const announce = useCallback<AnnounceFn>((message, politeness = "polite") => {
     const setter = politeness === "assertive" ? setAssertive : setPolite;
     // Clear first so repeating the same message still triggers an announcement.
     setter("");
-    window.setTimeout(() => setter(message), 50);
+    if (timeoutRef.current !== null) {
+      window.clearTimeout(timeoutRef.current);
+    }
+    timeoutRef.current = window.setTimeout(() => {
+      timeoutRef.current = null;
+      setter(message);
+    }, 50);
   }, []);
 
   const value = useMemo(() => announce, [announce]);
@@ -49,6 +57,7 @@ export function LiveRegionProvider({ children }: { children: ReactNode }) {
         role="status"
         aria-live="polite"
         aria-atomic="true"
+        data-testid="live-region-polite"
         className="sr-only"
       >
         {polite}
@@ -57,6 +66,7 @@ export function LiveRegionProvider({ children }: { children: ReactNode }) {
         role="alert"
         aria-live="assertive"
         aria-atomic="true"
+        data-testid="live-region-assertive"
         className="sr-only"
       >
         {assertive}

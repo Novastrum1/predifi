@@ -8,6 +8,11 @@
  * - axe scan on the success state
  * - keyboard-only flow: Tab through all fields, add/remove outcomes,
  *   trigger validation, fix errors, and complete a valid submission
+ * - focus restoration after the token picker dialog closes
+ * - live-region announcements for wallet-state and transaction-state changes
+ *
+ * See docs/ACCESSIBILITY.md for the documented, narrowly scoped exclusions
+ * applied to these journeys.
  */
 import React from "react";
 import { render, screen, within, act, waitFor } from "@testing-library/react";
@@ -18,6 +23,20 @@ import { CreatePoolForm } from "@/components/pool/CreatePoolForm";
 // ── Mock next/navigation (used by the SuccessState) ──────────────────────────
 jest.mock("next/navigation", () => ({
   useRouter: () => ({ push: jest.fn(), back: jest.fn(), forward: jest.fn() }),
+}));
+
+// ── Deterministic wallet mock ────────────────────────────────────────────────
+// The wallet state is mocked so the suite is deterministic in CI. The mock
+// exposes a stable connected address and a no-op connect/disconnect surface.
+const mockWallet = {
+  address: "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF",
+  connected: true,
+  connect: jest.fn(),
+  disconnect: jest.fn(),
+};
+
+jest.mock("@/hooks/useWallet", () => ({
+  useWallet: () => mockWallet,
 }));
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
@@ -383,6 +402,105 @@ describe("CreatePoolForm keyboard-only flow", () => {
     await waitFor(() => {
       expect(getStatusRegion()).toHaveTextContent(/pool created successfully/i);
     });
+  });
+
+  it("restores focus to the token picker trigger after the dialog closes", async () => {
+    const user = userEvent.setup();
+    render(<CreatePoolForm />);
+
+    const tokenTrigger = screen.getByRole("button", { name: /select token/i });
+    tokenTrigger.focus();
+    expect(tokenTrigger).toHaveFocus();
+
+    // Open the token picker dialog via keyboard.
+    await user.keyboard("{Enter}");
+
+    const dialog = await screen.findByRole("dialog");
+    expect(dialog).toBeInTheDocument();
+
+    // Focus must move into the dialog.
+    await waitFor(() => {
+      expect(dialog.contains(document.activeElement)).toBe(true);
+    });
+
+    // Close the dialog with Escape.
+    await user.keyboard("{Escape}");
+
+    await waitFor(() => {
+      expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    });
+
+    // Focus must be restored to the trigger that opened the dialog.
+    expect(tokenTrigger).toHaveFocus();
+  });
+
+  it("announces wallet-state changes through the status live region", async () => {
+    const user = userEvent.setup();
+    render(<CreatePoolForm />);
+
+    // Disconnecting the wallet must be announced politely.
+    mockWallet.connected = false;
+    await act(async () => {
+      mockWallet.disconnect();
+    });
+
+    await waitFor(() => {
+      expect(getStatusRegion()).toHaveTextContent(/wallet/i);
+    });
+
+    // Reconnecting must also be announced.
+    mockWallet.connected = true;
+    await act(async () => {
+      mockWallet.connect();
+    });
+
+    await waitFor(() => {
+      expect(getStatusRegion()).toHaveTextContent(/wallet/i);
+    });
+
+    // Restore deterministic default for subsequent tests.
+    mockWallet.connected = true;
+  });
+
+  it("announces transaction-state changes through the status live region", async () => {
+    const user = userEvent.setup();
+    render(<CreatePoolForm />);
+
+    // Fill the minimum required fields to reach submission.
+    await user.type(screen.getByLabelText(/pool name/i), "Will BTC reach $100K by end of year?");
+    await user.type(
+      screen.getByLabelText(/description/i),
+      "Prediction market pool for BTC price action in 2026.",
+    );
+    await user.selectOptions(screen.getByLabelText(/category/i), "Crypto");
+    await user.type(screen.getByLabelText("Outcome 1"), "Yes");
+    await user.type(screen.getByLabelText("Outcome 2"), "No");
+    await user.type(screen.getByLabelText(/minimum stake/i), "5");
+    await user.type(screen.getByLabelText(/maximum stake/i), "500");
+    await user.type(screen.getByLabelText(/close time/i), validCloseTime());
+
+    const termsCheckbox = screen.getByRole("checkbox", {
+      name: /smart contracts on the stellar network/i,
+    });
+    termsCheckbox.focus();
+    await user.keyboard(" ");
+
+    const submitButton = screen.getByRole("button", { name: /create pool/i });
+    submitButton.focus();
+    await user.keyboard("{Enter}");
+
+    // The pending transaction state must be announced.
+    await waitFor(() => {
+      expect(getStatusRegion()).toHaveTextContent(/creating|submitting|pending/i);
+    });
+
+    // The terminal success state must be announced.
+    await waitFor(
+      () => {
+        expect(getStatusRegion()).toHaveTextContent(/pool created successfully/i);
+      },
+      { timeout: 3000 },
+    );
   });
 
   it("shows validation errors and allows correcting them via keyboard", async () => {

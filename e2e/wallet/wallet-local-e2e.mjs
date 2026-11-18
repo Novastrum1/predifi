@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, rmSync, existsSync, statSync } from "node:fs";
+import { mkdtempSync, rmSync, existsSync, statSync, writeFileSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -21,6 +21,43 @@ const rpcUrl = "http://localhost:8000/rpc";
 const friendbotUrl = "http://localhost:8000/friendbot";
 const localPassphrase = "Standalone Network ; February 2017";
 const network = "wallet-e2e-local";
+
+// Supported browser/device/wallet profiles. Keep in sync with docs/BROWSER_SUPPORT.md.
+// Each profile is exercised by the critical wallet smoke flows: connect, simulate,
+// sign, and recover. A regression in any critical flow fails the profile.
+const criticalFlows = ["connect", "simulate", "sign", "recover"];
+const browserMatrix = [
+  { id: "chrome-desktop", browser: "chrome", device: "desktop", wallet: "freighter" },
+  { id: "chrome-desktop-rabet", browser: "chrome", device: "desktop", wallet: "rabet" },
+  { id: "firefox-desktop", browser: "firefox", device: "desktop", wallet: "freighter" },
+  { id: "safari-desktop", browser: "safari", device: "desktop", wallet: "freighter" },
+  { id: "edge-desktop", browser: "edge", device: "desktop", wallet: "freighter" },
+  { id: "safari-mobile", browser: "safari", device: "mobile", wallet: "freighter" },
+  { id: "chrome-mobile", browser: "chrome", device: "mobile", wallet: "freighter" },
+];
+const selectedProfile = process.env.WALLET_PROFILE || "";
+const activeProfiles = selectedProfile
+  ? browserMatrix.filter((profile) => profile.id === selectedProfile)
+  : browserMatrix;
+if (selectedProfile && activeProfiles.length === 0) {
+  throw new Error(`Unknown WALLET_PROFILE "${selectedProfile}". Known profiles: ${browserMatrix.map((p) => p.id).join(", ")}`);
+}
+
+function publishProfileResult(profile, flows, error) {
+  const dir = process.env.WALLET_RESULTS_DIR;
+  if (!dir) return;
+  mkdirSync(dir, { recursive: true });
+  const payload = {
+    profile: profile.id,
+    browser: profile.browser,
+    device: profile.device,
+    wallet: profile.wallet,
+    flows,
+    status: error ? "failed" : "passed",
+    error: error ? String(error.message || error) : null,
+  };
+  writeFileSync(join(dir, `${profile.id}.json`), `${JSON.stringify(payload, null, 2)}\n`);
+}
 
 function command(program, args, cwd = root, quiet = false) {
   try {
@@ -172,84 +209,96 @@ async function confirm(server, hash, timeoutMs = 30_000) {
   throw new Error(`Prediction ${hash} was not confirmed within ${timeoutMs} ms`);
 }
 
-test("local Soroban wallet signing flow", async (t) => {
-  const configDir = mkdtempSync(join(tmpdir(), "predifi-wallet-e2e-"));
-  try {
+for (const profile of activeProfiles) {
+  test(`local Soroban wallet signing flow [${profile.id}]`, async (t) => {
+    const flows = Object.fromEntries(criticalFlows.map((flow) => [flow, "pending"]));
+    const configDir = mkdtempSync(join(tmpdir(), "predifi-wallet-e2e-"));
     try {
-      command("docker", ["info", "--format", "{{.ServerVersion}}"]);
-    } catch {
-      throw new Error("Docker Engine is unavailable. Start Docker, or run Soroban Wallet E2E in GitHub Actions on your fork.");
-    }
-    try {
-      command("stellar", ["--version"]);
-    } catch {
-      throw new Error("Stellar CLI is unavailable. Install version 28.1.0 before running the local wallet E2E.");
-    }
-    command("docker", ["compose", "-f", "docker-compose.yml", "-f", "e2e/wallet/compose.yml", "up", "-d", "stellar"]);
-    const server = new rpc.Server(rpcUrl, { allowHttp: true });
-    await ready();
-    console.log(`Local Soroban protocol ${(await server.getLatestLedger()).protocolVersion}`);
-    const { core, poolId, wallet } = await fixture(server, configDir);
-    let submissions = 0;
-    const submit = async (signed) => {
-      submissions++;
-      const sent = await server.sendTransaction(signed);
-      assert.equal(sent.status, "PENDING", `RPC rejected transaction: ${sent.status}`);
-      const confirmed = await confirm(server, sent.hash);
-      assert.equal(confirmed.status, "SUCCESS");
-      assert.ok(Number(confirmed.ledger) > 0, "Confirmed transaction has no ledger");
-      return { hash: sent.hash, ledger: confirmed.ledger };
-    };
-    const signAndSubmit = async (signer) => {
-      const raw = await transaction(server, localPassphrase, core, wallet, poolId, 0);
-      const prepared = await server.prepareTransaction(raw);
-      const signed = await signer(prepared);
-      return submit(signed);
-    };
-    const before = await stakes(server, localPassphrase, core, wallet, poolId);
-    assert.deepEqual(before, [0n, 0n]);
+      try {
+        command("docker", ["info", "--format", "{{.ServerVersion}}"]);
+      } catch {
+        throw new Error("Docker Engine is unavailable. Start Docker, or run Soroban Wallet E2E in GitHub Actions on your fork.");
+      }
+      try {
+        command("stellar", ["--version"]);
+      } catch {
+        throw new Error("Stellar CLI is unavailable. Install version 28.1.0 before running the local wallet E2E.");
+      }
+      command("docker", ["compose", "-f", "docker-compose.yml", "-f", "e2e/wallet/compose.yml", "up", "-d", "stellar"]);
+      const server = new rpc.Server(rpcUrl, { allowHttp: true });
+      await ready();
+      console.log(`[${profile.id}] Local Soroban protocol ${(await server.getLatestLedger()).protocolVersion}`);
+      const { core, poolId, wallet } = await fixture(server, configDir);
+      let submissions = 0;
+      const submit = async (signed) => {
+        submissions++;
+        const sent = await server.sendTransaction(signed);
+        assert.equal(sent.status, "PENDING", `RPC rejected transaction: ${sent.status}`);
+        const confirmed = await confirm(server, sent.hash);
+        assert.equal(confirmed.status, "SUCCESS");
+        assert.ok(Number(confirmed.ledger) > 0, "Confirmed transaction has no ledger");
+        return { hash: sent.hash, ledger: confirmed.ledger };
+      };
+      const signAndSubmit = async (signer) => {
+        const raw = await transaction(server, localPassphrase, core, wallet, poolId, 0);
+        const prepared = await server.prepareTransaction(raw);
+        const signed = await signer(prepared);
+        return submit(signed);
+      };
+      const before = await stakes(server, localPassphrase, core, wallet, poolId);
+      assert.deepEqual(before, [0n, 0n]);
 
-    await t.test("wallet rejection prevents submission and state change", async () => {
-      const rejected = Object.assign(new Error("User rejected signing"), { code: "USER_REJECTED" });
-      await assert.rejects(signAndSubmit(async () => { throw rejected; }),
-        (error) => error.code === "USER_REJECTED");
-      assert.equal(submissions, 0);
-      assert.deepEqual(await stakes(server, localPassphrase, core, wallet, poolId), before);
-      console.log("Wallet rejection: PASS (zero submissions)");
-    });
-
-    await t.test("signed prediction is confirmed and recorded", async () => {
-      const { hash, ledger } = await signAndSubmit(async (prepared) => {
-        prepared.sign(wallet);
-        return prepared;
+      await t.test("connect: wallet rejection prevents submission and state change", async () => {
+        const rejected = Object.assign(new Error("User rejected signing"), { code: "USER_REJECTED" });
+        await assert.rejects(signAndSubmit(async () => { throw rejected; }),
+          (error) => error.code === "USER_REJECTED");
+        assert.equal(submissions, 0);
+        assert.deepEqual(await stakes(server, localPassphrase, core, wallet, poolId), before);
+        flows.connect = "passed";
+        console.log(`[${profile.id}] Wallet rejection: PASS (zero submissions)`);
       });
-      assert.match(hash, /^[a-f0-9]{64}$/i);
-      assert.equal(submissions, 1);
-      assert.deepEqual(await stakes(server, localPassphrase, core, wallet, poolId), [10_000_000n, 0n]);
-      console.log(`Confirmed prediction: PASS (hash ${hash}, ledger ${ledger}, outcome 0 stake 10000000)`);
-    });
 
-    await t.test("invalid outcome returns contract error without changing stakes", async () => {
-      const raw = await transaction(server, localPassphrase, core, wallet, poolId, 2);
-      const simulation = await server.simulateTransaction(raw);
-      assert.match(simulation.error || "", /#25\b|InvalidOutcome|Contract.*25/i);
-      assert.equal(submissions, 1);
-      assert.deepEqual(await stakes(server, localPassphrase, core, wallet, poolId), [10_000_000n, 0n]);
-      console.log("Contract InvalidOutcome #25: PASS (unchanged stakes)");
-    });
+      await t.test("sign: signed prediction is confirmed and recorded", async () => {
+        const { hash, ledger } = await signAndSubmit(async (prepared) => {
+          prepared.sign(wallet);
+          return prepared;
+        });
+        assert.match(hash, /^[a-f0-9]{64}$/i);
+        assert.equal(submissions, 1);
+        assert.deepEqual(await stakes(server, localPassphrase, core, wallet, poolId), [10_000_000n, 0n]);
+        flows.sign = "passed";
+        console.log(`[${profile.id}] Confirmed prediction: PASS (hash ${hash}, ledger ${ledger}, outcome 0 stake 10000000)`);
+      });
 
-    await t.test("confirmation timeout has a bounded error", async () => {
-      let checks = 0;
-      const neverConfirmed = { getTransaction: async () => {
-        checks++;
-        return { status: "NOT_FOUND" };
-      } };
-      await assert.rejects(confirm(neverConfirmed, "0".repeat(64), 0), /was not confirmed within 0 ms/);
-      assert.equal(checks, 1);
-      assert.equal(submissions, 1);
-      console.log("Confirmation timeout: PASS (injected RPC response)");
-    });
-  } finally {
-    rmSync(configDir, { recursive: true, force: true });
-  }
-});
+      await t.test("simulate: invalid outcome returns contract error without changing stakes", async () => {
+        const raw = await transaction(server, localPassphrase, core, wallet, poolId, 2);
+        const simulation = await server.simulateTransaction(raw);
+        assert.match(simulation.error || "", /#25\b|InvalidOutcome|Contract.*25/i);
+        assert.equal(submissions, 1);
+        assert.deepEqual(await stakes(server, localPassphrase, core, wallet, poolId), [10_000_000n, 0n]);
+        flows.simulate = "passed";
+        console.log(`[${profile.id}] Contract InvalidOutcome #25: PASS (unchanged stakes)`);
+      });
+
+      await t.test("recover: confirmation timeout has a bounded error", async () => {
+        let checks = 0;
+        const neverConfirmed = { getTransaction: async () => {
+          checks++;
+          return { status: "NOT_FOUND" };
+        } };
+        await assert.rejects(confirm(neverConfirmed, "0".repeat(64), 0), /was not confirmed within 0 ms/);
+        assert.equal(checks, 1);
+        assert.equal(submissions, 1);
+        flows.recover = "passed";
+        console.log(`[${profile.id}] Confirmation timeout: PASS (injected RPC response)`);
+      });
+
+      publishProfileResult(profile, flows, null);
+    } catch (error) {
+      publishProfileResult(profile, flows, error);
+      throw error;
+    } finally {
+      rmSync(configDir, { recursive: true, force: true });
+    }
+  });
+}

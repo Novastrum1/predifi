@@ -70,4 +70,63 @@ describe('Release metadata and build provenance validation', () => {
       /unsupported client version/
     );
   });
+
+  it('rejects release if build provenance metadata is missing', () => {
+    const invalid = JSON.parse(JSON.stringify(baseExample));
+    delete invalid.build.provenance;
+    assert.throws(
+      () => validateRelease(invalid),
+      /missing build provenance/
+    );
+  });
+
+  it('rejects release if dependency lockfile hash is missing', () => {
+    const invalid = JSON.parse(JSON.stringify(baseExample));
+    delete invalid.build.provenance.lockfile_sha256;
+    assert.throws(
+      () => validateRelease(invalid),
+      /missing dependency lockfile hash/
+    );
+  });
+
+  it('rejects release if dependency lockfile hash does not match the lockfile', () => {
+    const invalid = JSON.parse(JSON.stringify(baseExample));
+    invalid.build.provenance.lockfile_sha256 = '0'.repeat(64);
+    assert.throws(
+      () => validateRelease(invalid),
+      /lockfile hash mismatch/
+    );
+  });
+
+  it('rejects release if artifact digest does not match the recorded provenance digest', () => {
+    const invalid = JSON.parse(JSON.stringify(baseExample));
+    invalid.build.provenance.artifact_sha256 = '0'.repeat(64);
+    assert.throws(
+      () => validateRelease(invalid),
+      /artifact digest mismatch/
+    );
+  });
+
+  it('accepts a clean repeated build with identical artifact digests', () => {
+    const repeated = JSON.parse(JSON.stringify(baseExample));
+    repeated.build.provenance.repeated_build = {
+      artifact_sha256: baseExample.artifacts[0].sha256,
+      lockfile_sha256: baseExample.build.provenance.lockfile_sha256,
+    };
+    assert.doesNotThrow(() => {
+      validateRelease(repeated);
+    });
+  });
+
+  it('rejects release if a repeated clean build produces a different artifact digest', () => {
+    const invalid = JSON.parse(JSON.stringify(baseExample));
+    invalid.build.provenance.repeated_build = {
+      artifact_sha256: '0'.repeat(64),
+      lockfile_sha256: baseExample.build.provenance.lockfile_sha256,
+    };
+    assert.throws(
+      () => validateRelease(invalid),
+      /non-reproducible build/
+    );
+  });
 });
